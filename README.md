@@ -419,6 +419,358 @@ reachy-mini-conversation-app --robot-name <name>
 
 </details>
 
+## Fork personnel deadbone : audit et maintenance
+
+Ajout propre au fork, le 16 octobre 2026. L'application, ses identifiants, ses
+licences et ses attributions Pollen Robotics sont conservés. Cette section est
+un audit et un guide de préparation ; les fonctions des phases 2 à 7 ne sont pas
+encore implémentées. Aucune issue ni PR upstream n'est créée.
+
+### Périmètre et architecture vérifiés
+
+Base auditée : application `0a3ef5c07c4c9ba58ceaf788244393033acd88c7` (1.1.1), SDK
+source `4c2b51a53f7a57c0e1eb1cc41c0cfda0e5c601b0`. Le SDK installé par `uv.lock`
+est **1.12.0**, tandis que le checkout SDK consulté affiche 1.12.0.dev0 : les
+signatures utiles ont aussi été vérifiées dans le SDK installé.
+
+Lecture intégrale des fichiers racine `AGENTS.md`, `CONTRIBUTING.md`, `README.md`,
+`pyproject.toml`, `CLAUDE.md`, de `.env.example` et des workflows de validation ;
+aucune instruction d'agent imbriquée trouvée dans l'application. Les règles de
+création d'une nouvelle application du SDK ne s'appliquent pas à ce fork d'une
+application existante. Le SDK reste une dépendance, sans modification ni copie
+de ses composants internes.
+
+| Composant existant | Rôle et réutilisation |
+|---|---|
+| `main.py`, `app_lifecycle.py` | CLI, classe `ReachyMiniApp`, démarrage, arrêt, sommeil et serveur UI. |
+| `console.py`, `streaming.py` | Flux microphone/haut-parleur, lecture audio cadencée, interruptions, reconnexion, JSON-RPC `/rpc`, historique temporaire et diagnostic. |
+| `huggingface_realtime.py` | Session WebSocket, transcription, réponses audio, outils, images, envoi sérialisé des demandes de réponse. Un seul backend logique Hugging Face, avec serveur déployé ou direct local. |
+| `audio/local_vad.py` | Silero ONNX local, barge-in avec confirmation du VAD serveur. Dégradation vers le VAD serveur en cas d'échec. |
+| `moves.py`, `dance_emotion_moves.py` | File de mouvements, respiration, danse, émotions et mouvement pendant la parole. |
+| `tools/core_tools.py`, `background_tool_manager.py` | Découverte et exécution des outils internes/externes, tâches asynchrones, annulation et état. |
+| `personality.py`, `profile_store.py`, `profile_toolsets.py` | Profils déclaratifs, personnalités utilisateur, sélection des outils par profil. |
+| `memory.py`, `memory_routes.py` | Mémoire JSON commune, 60 faits de 280 caractères maximum ; consultation, suppression, activation et actualisation du prompt. |
+| `idle_policy.py`, `ConversationHandler.emit()` | Initiatives locales après 180 secondes d'inactivité, si les mouvements et la réponse en cours le permettent. |
+| `settings_store.py`, `startup_settings.py`, `static/` | Paramètres persistants et interface existante à étendre ; aucun second panneau d'administration nécessaire. |
+
+La conversation, le suivi de tête, les outils caméra, les profils, la mémoire
+commune, les diagnostics VAD/latence et le choix local/déployé sont réutilisables.
+Le suivi de visage public du SDK suit un visage proche, sans identité ni
+identification du locuteur. Le daemon utilise déjà YuNet avec ONNX Runtime ;
+`get_tracked_face()` ne fournit pas une galerie d'identités ni les cinq points
+nécessaires à SFace. Ne pas importer son détecteur interne dans le fork.
+
+### Arbitrages et modifications nécessaires
+
+**Visages (phase 2).** Prévoir un module optionnel, désactivé par défaut, avec
+une tâche à faible fréquence lisant `robot.media.get_frame()` ; ne jamais ouvrir
+une deuxième caméra OpenCV. Faire l'inférence hors de la boucle asyncio audio,
+avec une seule analyse en cours, abandon des images périmées et arrêt borné.
+Commencer avec 1 analyse/seconde et un nombre de threads limité, à ajuster par
+mesure. Plusieurs visages détectés ne signifient pas plusieurs inférences à
+chaque image : réutiliser les observations stables et borner le travail.
+
+Enrôlement : consentement explicite, nom et identifiant stable, 3 à 5 photos,
+un seul visage par photo, contrôles de taille, flou et pose, empreintes et
+modèles versionnés. Prévoir liste, mise à jour, suppression complète, seuil de
+similarité, marge entre les deux meilleurs candidats, état inconnu et plusieurs
+observations concordantes. Aucun seuil de publication ne vaut calibration pour
+ce foyer. Une photo peut tromper ce dispositif : ce n'est pas une authentification.
+Photos et empreintes resteront hors Git et ne seront jamais ajoutées au prompt,
+aux outils distants ou aux journaux. Répertoire privé (0700) et fichiers privés
+(0600) sur les systèmes POSIX, permissions équivalentes à documenter ailleurs.
+
+**Mémoire (phase 3).** Conserver le JSON commun et ses commandes. Ajouter un
+stockage séparé par identifiant, probablement SQLite de la bibliothèque standard
+pour les transactions, la rétention et la suppression. Ne pas convertir tous les
+anciens faits en souvenirs attribués à une personne. L'identité visuelle est un
+contexte de présence ; l'identité du locuteur exige une confirmation explicite.
+En présence ambiguë, rester sur la mémoire commune. Tester accès croisés,
+suppression, expiration, changements d'interlocuteur et absence d'identité.
+
+**Confidentialité.** Aujourd'hui la mémoire activée est injectée dans les
+instructions du backend sélectionné ; le stockage local ne garantit donc pas
+l'absence d'envoi au cloud. L'outil caméra transmet aussi des images au backend.
+Pour les premiers essais privés : désactiver mémoire et caméra, ou sélectionner
+un endpoint local vérifié et désactiver les outils distants du profil. Les futurs
+souvenirs personnels nécessitent une politique explicite de destination avant
+injection. L'enrôlement local ne devra jamais appeler l'outil caméra conversationnel.
+
+**Initiatives (phase 4).** Réutiliser `ConversationHandler.say()` et son envoi
+sérialisé existant : cette API injecte une instruction que le modèle peut
+reformuler, ce n'est pas une synthèse littérale. Ajouter une file d'événements
+bornée distincte de l'audio : priorité, expiration, déduplication, délai minimal,
+heures de silence avec fuseau, activation par comportement, attente de fin de
+parole humaine et de lecture du robot. `say()` seul ne protège pas contre une
+injection au milieu d'une parole humaine : prévoir un garde explicite dans le
+handler partagé plutôt qu'une seconde session audio. Les salutations doivent
+suivre les transitions de présence, avec temporisation, jamais chaque image.
+
+**IA (phase 5).** Le choix officiel/local existe déjà ; ne pas ressusciter les
+anciens sélecteurs `BACKEND_PROVIDER` et `MODEL_NAME`. La piste prioritaire est
+[speech-to-speech](https://github.com/huggingface/speech-to-speech), serveur vocal
+compatible avec le protocole Realtime attendu. Sa documentation prévoit Apple
+Silicon/MLX et 16 Go avec un petit modèle quantifié. llama.cpp peut alimenter son
+étage LLM ; Ollama demande une vérification équivalente de l'adaptateur texte.
+Ces serveurs texte seuls ne remplacent pas le serveur vocal Realtime. Aucun
+serveur vocal ni modèle LLM n'a été installé ou mesuré pendant la phase 1.
+Commencer par la sélection entre sessions. Un basculement automatique devra
+préserver explicitement l'historique et les outils, gérer les délais et ne jamais
+exporter silencieusement des souvenirs. Les reconnexions actuelles ne prouvent
+pas cette continuité. Aucun fallback cloud automatique en phase 1.
+
+Le mode déployé officiel ne requiert pas de clé API OpenAI dans l'application,
+mais sa disponibilité et ses conditions futures ne sont pas garanties. Le paquet
+`openai` sert de client de protocole ; il n'implique pas de facturation OpenAI.
+Un fonctionnement vocal entièrement autonome, gratuit et sans Mac sur CM4 n'est
+pas démontré. Mac éteint : la vision locale et les outils locaux pourront rester
+actifs, mais la conversation dépendra d'un serveur vocal disponible. Le NAS peut
+héberger de petits services et sauvegardes ; ne pas présumer qu'il peut remplacer
+le Mac pour l'inférence vocale.
+
+**Intégrations (phase 6).** Synology : outils Python externes locaux, client
+`httpx` déjà présent, découverte via `SYNO.API.Info`, authentification officielle,
+TLS, délais bornés, compte minimal et lecture seule initialement. Vérifier sur
+la version DSM réellement installée les API disponibles pour sauvegardes et
+conteneurs ; ne pas inventer de routes ni supposer des permissions Docker.
+Une action sensible exige une confirmation portant sur ses paramètres et sa
+validité, contrôlée côté outil. Ne pas confier cette sécurité au seul prompt.
+Référence : [documentation développeur Synology](https://www.synology.com/en-global/support/developer).
+
+Telegram : API Bot officielle avec `httpx`, liste d'identifiants numériques
+autorisés avant tout traitement, envoi texte puis `sendVoice`, réception par
+long polling avec timeout, téléchargement et taille bornés, validation des types
+et suppression des fichiers temporaires. Secrets hors Git. Telegram transmet
+les messages à son infrastructure : destination à autoriser explicitement pour
+les contenus privés. Les voix entrantes exigent un chemin STT à étudier ; ne pas
+ouvrir une deuxième session vocale du robot. Les appels ne font pas partie de
+la [Bot API standard](https://core.telegram.org/bots/api) ; MTProto est hors périmètre.
+L'échec de ces intégrations ne devra pas empêcher le démarrage de l'application.
+
+### Dépendances et licences envisagées
+
+Aucune dépendance applicative ajoutée en phase 1 ; `uv.lock` est inchangé.
+
+| Élément | Justification, licence et réserve |
+|---|---|
+| Application et SDK | Apache-2.0 ; conserver les notices. Le SDK reste installé depuis le lock. |
+| OpenCV CPU | Candidat pour `FaceDetectorYN` / `FaceRecognizerSF`, sans GPU ni CUDA. OpenCV récent : Apache-2.0 ; packaging opencv-python : MIT et notices tierces. Choisir un seul paquet `cv2`, headless si compatible avec l'installation SDK ; ne pas installer les variantes en parallèle. |
+| YuNet OpenCV Zoo | [MIT](https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE), détection et cinq points ; version et hash des poids à figer avant intégration. |
+| SFace OpenCV Zoo | [Apache-2.0](https://github.com/opencv/opencv_zoo/blob/main/models/face_recognition_sface/LICENSE), empreintes locales. Vérifier ensemble conversion ONNX, alignement et API OpenCV. |
+| ONNX Runtime / NumPy | Déjà transitifs via le SDK, MIT / BSD-3-Clause ; éviter un deuxième runtime inutile. |
+| SQLite | Module Python standard, moteur dans le domaine public ; pas de serveur additionnel. |
+| speech-to-speech, MLX | Serveur séparé sur Mac : Apache-2.0 / MIT. Ne pas alourdir les dépendances embarquées du fork. |
+| Modèles vocaux/LLM | Qwen3.5-4B et Qwen3-TTS 0.6B CustomVoice : fiches officielles Apache-2.0. Chaque checkpoint STT et conversion MLX devra avoir sa propre provenance/licence vérifiée avant choix final ; la fiche de la conversion MLX consultée n'affiche pas de model card. |
+| Synology / Telegram | Réutiliser `httpx` (BSD-3-Clause) ; aucun SDK tiers nécessaire pour le premier incrément. |
+
+Sources modèles : [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-4B),
+[Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice),
+[conversion MLX envisagée](https://huggingface.co/mlx-community/Qwen3.5-4B-4bit).
+Les roues GStreamer installées par le SDK incluent des composants GPL et des
+plugins restreints : conserver leurs notices et examiner leurs conditions avant
+toute redistribution d'une image ou d'un bundle binaire. Une licence de code
+ne remplace pas la vérification de celle des poids.
+
+### Matériel, mesures et limites
+
+Le [matériel officiel](https://github.com/pollen-robotics/reachy_mini/blob/main/docs/source/platforms/reachy_mini/hardware.md)
+indique CM4 ARM64, 4 Go de RAM, 16 Go de flash, caméra IMX708 grand angle et audio
+XMOS. OpenCV Zoo publie des essais CPU sur Raspberry Pi 4B : environ 6,23 ms pour
+YuNet à 160×120 et 68,82 ms pour SFace à 150×150 dans son
+[benchmark](https://github.com/opencv/opencv_zoo/tree/main/benchmark).
+Ce sont des références sur Pi 4B, pas des mesures sur Reachy CM4 chargé par
+l'audio, les mouvements et le daemon. Le multi-visage augmente le coût SFace.
+PyPI publie des roues `opencv-python-headless` 5.0.0.93 pour macOS ARM64 et
+Linux aarch64 (manylinux 2.17 et 2.28), vérifiées sans installation. Cela ne
+valide pas cette version pour le SDK : son extra OpenCV impose actuellement
+`opencv-python<=5.0`. Choisir et verrouiller une version compatible avec le
+SDK, Python, NumPy et l’OS livré, puis tester ses API et les modèles.
+
+Mesurer : durée d'inférence p50/p95, CPU du processus et du système, RSS,
+température, images périmées, cadence réelle, délai vocal, interruptions et
+arrêt des tâches. Les futurs objectifs doivent être confrontés à une mesure de
+référence de l'application officielle, avec et sans reconnaissance activée.
+Tester inconnus, lumière faible, lunettes, angles, mouvement, deux personnes
+et progression vers dix identités consentantes. L'exactitude LFW publiée par
+SFace ne garantit pas les résultats domestiques.
+
+Le simulateur reproduit la mécanique, pas l'optique réelle, l'IMU Wireless,
+l'écho XMOS, le Wi-Fi, la batterie ou l'échauffement du CM4. L'audio de simulation
+utilise les périphériques du Mac et un traitement logiciel d'écho. Aucune
+validation sur robot physique n'est revendiquée avant livraison.
+
+### Phases et critères de sortie
+
+| Phase | Incrément indépendant | Validation requise |
+|---|---|---|
+| 0 | Audit, points d'extension, risques et licences | Sources et versions identifiées, distinction présence/locuteur, aucune dépendance payante imposée. |
+| 1 | Vrai fork, remotes, branche de travail, environnement verrouillé | Ruff, format, mypy, pytest ; connexion SDK MuJoCo ; distinguer démarrage UI et échange vocal. |
+| 2 | Enrôlement, galerie locale, reconnaissance optionnelle, UI minimale | Tests images synthétiques/fixtures non biométriques, multi-visage/inconnu/stabilisation/suppression ; modèles publics pour essais consentis hors Git ; mesures CM4 en attente. |
+| 3 | Mémoire personnelle séparée et contexte explicitement confirmé | Tests de non-mélange, export interdit vers cloud par défaut, rétention et suppression ; mémoire commune inchangée. |
+| 4 | File d'événements, salutations et comportements optionnels | Horloge simulée, priorités, délais, silence, parole active, absence de répétition, arrêt propre ; une seule session. |
+| 5 | Serveur local éprouvé, sélection entre sessions, étude auto | Français, STT/TTS, outils, caméra, interruption, panne/récupération, mémoire et latence sur M4 ; auto seulement après preuve de continuité et consentement cloud. |
+| 6 | Synology lecture seule, puis Telegram texte/voix par incréments | Réponses simulées, authentification/pannes, refus des utilisateurs interdits et des écritures non confirmées ; essai réel séparé. |
+| 7 | Installation Wireless, sauvegarde, démarrage et retour officiel | Validation physique, une app à la fois, données restaurables, mise à jour et retour arrière éprouvés. |
+
+Outils Synology et profils personnels peuvent se développer sans modifier le
+moteur grâce aux répertoires externes. Le serveur vocal local peut aussi être
+configuré sans fork. La reconnaissance continue, sa gestion UI, la mémoire par
+personne et l'ordonnancement d'initiatives demandent des extensions ciblées du
+cycle de vie et du contexte. Aucun de ces modules n'est introduit dans cette base.
+
+### Installation Mac et simulation
+
+Installer `uv`, Python 3.12 et Git LFS selon leurs distributions officielles.
+Git LFS est indispensable : sans lui les avatars restent des pointeurs texte.
+Dans ce workspace, des binaires locaux `uv` et `git-lfs` sont disponibles dans
+`../.tools/bin` ; ajouter ce dossier au PATH avant les commandes ci-dessous.
+
+```bash
+# Depuis le répertoire du fork déjà cloné dans ce workspace :
+export PATH="$(cd ../.tools/bin && pwd):$PATH"
+git lfs pull upstream
+uv sync --frozen --group dev --python 3.12
+
+# Extra de simulation, sans changer les dépendances de l'application :
+uv pip install --python .venv/bin/python 'reachy-mini[mujoco]==1.12.0'
+source .venv/bin/activate
+mjpython -m reachy_mini.daemon.app.main --sim
+```
+
+Dans un second terminal, activer le même venv, puis lancer
+`reachy-mini-conversation-app --ui`. Le daemon doit rester actif.
+Pour les essais privés, créer `.env` depuis `.env.example`, désactiver mémoire
+et caméra et sélectionner un serveur local disponible. Les préférences déjà
+sauvées dans l'UI prévalent sur les variables d'environnement.
+
+Le serveur vocal local est une étape ultérieure : suivre son guide officiel,
+puis configurer `HF_REALTIME_CONNECTION_MODE=local` et `HF_REALTIME_WS_URL` vers
+son endpoint `/v1/realtime`. Aucun téléchargement de modèles LLM n'est nécessaire
+aux tests unitaires du fork. Une nouvelle exécution de `uv sync` peut retirer
+les paquets MuJoCo installés hors lock ; réinstaller l'extra pour la simulation.
+
+Pour vérifier seulement MuJoCo et le SDK sans audio ni caméra :
+
+```bash
+mjpython -m reachy_mini.daemon.app.main --sim --headless --no-media \
+  --no-wake-up-on-start --no-goto-sleep-on-stop \
+  --dataset-update-interval 0 --fastapi-port 18000 --robot-name deadbone_phase1
+```
+
+Ce mode valide le daemon et la télémétrie SDK, pas la conversation. Ne pas le
+laisser tourner avec le flux audio de l'app : l'essai de phase 1 a montré une
+boucle de warnings très rapide lorsque l'audio est absent. C'est une limite de
+la base officielle à traiter dans un incrément `fix/` séparé si ce mode devient
+un scénario d'usage ; ne pas contourner le SDK ni désactiver les logs globalement.
+
+### Installation Wireless et protection des données
+
+Procédure à revérifier à réception avec la version réellement livrée, selon le
+[guide officiel Wireless](https://github.com/pollen-robotics/reachy_mini/blob/main/docs/source/platforms/reachy_mini/development_workflow.md).
+Ne pas exécuter ces opérations maintenant : aucun robot n'est disponible.
+
+Conserver l'installation officielle du gestionnaire d'apps. Pour le fork,
+préférer un checkout et un venv dédiés dans le compte utilisateur, avec un
+répertoire de données distinct ; arrêter l'app officielle dans Reachy Mini
+Control et désactiver son lancement automatique avant de démarrer le fork.
+Le SDK officiel documente `/venvs/apps_venv` pour l'environnement partagé : ne
+pas y installer ce fork sous le même nom de package, cela remplacerait l'app
+originale. Un venv distinct conserve le même package et la même CLI sans collision.
+
+Sur le robot uniquement, après confirmation du compte SSH et de son hostname :
+
+```bash
+# Dans un répertoire utilisateur choisi, hors installation officielle :
+git clone https://github.com/deadbone/reachy_mini_conversation_app.git
+cd reachy_mini_conversation_app
+git checkout chore/personal-fork-baseline
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/reachy-mini-conversation-app --ui
+```
+
+Cette variante pip n'utilise pas `uv.lock` : pour une reproduction exacte,
+utiliser `uv sync --frozen` lorsque uv et les dépendances système sont disponibles.
+Sur Linux, suivre les prérequis GStreamer officiels ; ne pas copier les roues Mac.
+La compatibilité de cet environnement isolé avec l'IPC/média sera à vérifier sur
+le robot. Aucun service systemd personnel ni enregistrement doublonné dans le
+catalogue n'est créé en phase 1.
+
+Les lancements CLI utilisent des emplacements différents des instances gérées :
+`memory.v1.json` sous XDG data (`~/.local/share/reachy_mini_conversation_app` par
+défaut) et contenu utilisateur sous `external_content/`. Les instances gérées
+résolvent leur dossier avec `resolve_instance_path()` et
+`REACHY_MINI_INSTANCE_PATH` défini **dans l'environnement du processus**. Cette
+variable seule ne fait pas passer la CLI dans le mode instance gérée. Ne pas
+promettre une isolation des données sur la seule base d'un `.env`.
+
+Pour isoler les essais CLI, utiliser un répertoire de travail et un
+`XDG_DATA_HOME` dédiés, puis lancer la CLI installée par son chemin absolu.
+Sauvegarder, application arrêtée : `.env`, mémoire, `settings.json`,
+`startup_settings.json`, personnalités, `profile_toolsets.json`, manifeste des
+Tools Spaces et futurs stores biométriques/personnels. Copier aussi les outils
+externes. Protéger et chiffrer les sauvegardes NAS, limiter leurs permissions ;
+la suppression biométrique doit inclure leur rétention. Aucun de ces contenus
+ne doit être ajouté à Git. `/personal_data/` et `/backups/` sont ignorés dans ce fork.
+
+Retour officiel : arrêter le processus du fork, fermer ses médias, réactiver
+l'app officielle depuis Reachy Mini Control avec ses propres données. Ne pas
+lancer simultanément deux apps ni réinstaller le SDK système. Le démarrage
+au boot du fork et sa validation physique restent en phase 7.
+
+### Synchronisation et retour à une base connue
+
+`origin` désigne `deadbone/reachy_mini_conversation_app`, `upstream` le dépôt
+Pollen Robotics. `main` conserve l'historique officiel et suit `origin/main`.
+Les changements de cette préparation restent sur `chore/personal-fork-baseline`.
+Ne pas pousser sur upstream et ne pas forcer les branches.
+
+Pour une base sans commits personnels sur main, avec arbre de travail propre :
+
+```bash
+git fetch origin
+git fetch upstream
+git switch main
+git merge --ff-only origin/main
+git merge --ff-only upstream/main
+# Après les vérifications :
+git push origin main
+git switch -c feat/local-face-recognition
+```
+
+Si `main` contient plus tard des commits personnels, effectuer l'intégration sur
+une branche `chore/sync-upstream-<date>` : partir de `main`, fusionner
+`upstream/main`, résoudre les conflits puis exécuter la gate avant intégration
+au fork. Ne pas utiliser `reset --hard` ou réécrire l'historique publié. Sauvegarder
+les données avant une migration, conserver le commit précédemment validé et
+utiliser un checkout/venv distinct pour revenir à ce commit.
+
+```bash
+uv run ruff check . --fix
+uv run ruff format .
+uv run mypy --pretty --show-error-codes
+uv run pytest tests/ -v
+```
+
+Examiner le diff après les corrections automatiques. Ne lancer ni workflow de
+release ni miroir HF sans configuration personnelle explicite. Les workflows,
+CONTRIBUTING, CODE_OF_CONDUCT et modèles de PR restent inchangés.
+
+### Résultat de la préparation du 16 octobre 2026
+
+- Vrai fork GitHub créé et parent vérifié ; historique complet de l'application conservé.
+- Python 3.12.14 ARM64, installation de 123 paquets depuis le lock, SDK 1.12.0.
+- Ruff : réussi ; format : 104 fichiers inchangés ; mypy : 53 fichiers sans erreur.
+- Pytest complet : **578 tests réussis** après récupération Git LFS et autorisation des sockets de test MCP locales. Premier passage : 572 réussis, 4 échecs et 2 erreurs dus aux avatars LFS, à uv absent du PATH des sous-processus et aux sockets bloquées par le sandbox.
+- Extra MuJoCo 3.3.0 installé hors dépendances applicatives ; daemon réellement lancé avec `--sim --headless --no-media`, statut simulation confirmé par SDK et pose 4×4 finie lue via `get_current_head_pose()`.
+- Application démarrée sur ce simulateur avec mémoire/caméra/VAD local désactivés et backend local volontairement absent ; page UI récupérée par HTTP. Le flux sans audio a produit des warnings en boucle : cet essai ne valide pas le fonctionnement vocal et n'est pas un mode d'exploitation recommandé.
+- Échange vocal réel, serveur local MLX, caméra, CM4, NAS et Telegram : **non testés**. La phase 1 constitue une base logicielle testée, avec validation vocale restant à compléter ; aucune validation matérielle implicite.
+- Seuls README racine, commentaires `.env.example` et `.gitignore` sont modifiés. Aucun code moteur, nouvelle option runtime, dépendance, workflow ou SVG généré modifié. Les fonctions personnelles ne sont pas implémentées à ce stade.
+
+Prochain incrément : phase 2, d'abord galerie et enrôlement testables sans robot,
+puis tâche de reconnaissance locale et UI. Compléter en parallèle la validation
+vocale de la base avec un serveur Realtime choisi et un véritable média de test.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [`AGENTS.md`](AGENTS.md) for coding-agent standards.

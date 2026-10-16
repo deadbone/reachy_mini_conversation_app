@@ -71,3 +71,7 @@ external_content/external_tools/*
 external_content/user_personalities/
 external_content/installed_tool_spaces.json
 external_content/profile_toolsets.json
+
+# Personal fork: keep local private stores and backups out of Git.
+/personal_data/
+/backups/
